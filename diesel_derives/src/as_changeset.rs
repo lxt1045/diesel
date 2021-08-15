@@ -30,24 +30,6 @@ pub fn derive(item: syn::DeriveInput) -> Result<proc_macro2::TokenStream, Diagno
         .iter()
         .filter(|f| !model.primary_key_names.contains(&f.column_name_ident()))
         .collect::<Vec<_>>();
-    let ref_changeset_ty = fields_for_update.iter().map(|field| {
-        field_changeset_ty(
-            field,
-            &table_name,
-            treat_none_as_null,
-            Some(quote!(&'update)),
-        )
-    });
-    let ref_changeset_expr = fields_for_update
-        .iter()
-        .map(|field| field_changeset_expr(field, &table_name, treat_none_as_null, Some(quote!(&))));
-    let direct_changeset_ty = fields_for_update
-        .iter()
-        .map(|field| field_changeset_ty(field, &table_name, treat_none_as_null, None));
-    let direct_changeset_expr = fields_for_update
-        .iter()
-        .map(|field| field_changeset_expr(field, &table_name, treat_none_as_null, None));
-
     if fields_for_update.is_empty() {
         Span::call_site()
             .error(
@@ -58,21 +40,58 @@ pub fn derive(item: syn::DeriveInput) -> Result<proc_macro2::TokenStream, Diagno
             .emit();
     }
 
-    Ok(wrap_in_dummy_mod(quote!(
-        use diesel::query_builder::AsChangeset;
-        use diesel::prelude::*;
+    let mut generate_borrowed_changeset = true;
 
-        impl #impl_generics AsChangeset for &'update #struct_name #ty_generics
-        #where_clause
-        {
-            type Target = #table_name::table;
-            type Changeset = <(#(#ref_changeset_ty,)*) as AsChangeset>::Changeset;
+    let mut direct_changeset_ty = Vec::with_capacity(fields_for_update.len());
+    let mut direct_changeset_expr = Vec::with_capacity(fields_for_update.len());
+    let mut ref_changeset_ty = Vec::with_capacity(fields_for_update.len());
+    let mut ref_changeset_expr = Vec::with_capacity(fields_for_update.len());
 
-            fn as_changeset(self) -> Self::Changeset {
-                (#(#ref_changeset_expr,)*).as_changeset()
-            }
+    for field in fields_for_update {
+        if let Some(ty) = field.ty_for_serialize()? {
+            direct_changeset_ty.push(field_changeset_ty_serialize_as(
+                field,
+                &table_name,
+                treat_none_as_null,
+                &ty,
+            ));
+            direct_changeset_expr.push(field_changeset_expr_serialize_as(
+                field,
+                &table_name,
+                treat_none_as_null,
+                &ty,
+            ));
+
+            generate_borrowed_changeset = false; // as soon as we hit one field with #[diesel(serialize_as)] there is no point in generating the impl of AsChangeset for borrowed structs
+        } else {
+            direct_changeset_ty.push(field_changeset_ty(
+                field,
+                &table_name,
+                treat_none_as_null,
+                None,
+            ));
+            direct_changeset_expr.push(field_changeset_expr(
+                field,
+                &table_name,
+                treat_none_as_null,
+                None,
+            ));
+            ref_changeset_ty.push(field_changeset_ty(
+                field,
+                &table_name,
+                treat_none_as_null,
+                Some(quote!(&'update)),
+            ));
+            ref_changeset_expr.push(field_changeset_expr(
+                field,
+                &table_name,
+                treat_none_as_null,
+                Some(quote!(&)),
+            ));
         }
+    }
 
+    let changeset_owned = quote! {
         impl #impl_generics AsChangeset for #struct_name #ty_generics
         #where_clause
         {
@@ -83,6 +102,32 @@ pub fn derive(item: syn::DeriveInput) -> Result<proc_macro2::TokenStream, Diagno
                 (#(#direct_changeset_expr,)*).as_changeset()
             }
         }
+    };
+
+    let changeset_borrowed = if generate_borrowed_changeset {
+        quote! {
+            impl #impl_generics AsChangeset for &'update #struct_name #ty_generics
+            #where_clause
+            {
+                type Target = #table_name::table;
+                type Changeset = <(#(#ref_changeset_ty,)*) as AsChangeset>::Changeset;
+
+                fn as_changeset(self) -> Self::Changeset {
+                    (#(#ref_changeset_expr,)*).as_changeset()
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    Ok(wrap_in_dummy_mod(quote!(
+        use diesel::query_builder::AsChangeset;
+        use diesel::prelude::*;
+
+        #changeset_owned
+
+        #changeset_borrowed
     )))
 }
 
@@ -118,5 +163,36 @@ fn field_changeset_expr(
         }
     } else {
         parse_quote!(#table_name::#column_name.eq(#lifetime self#field_access))
+    }
+}
+
+fn field_changeset_ty_serialize_as(
+    field: &Field,
+    table_name: &syn::Path,
+    treat_none_as_null: bool,
+    ty: &syn::Type,
+) -> syn::Type {
+    let column_name = field.column_name_ident();
+    if !treat_none_as_null && is_option_ty(&field.ty) {
+        let inner_ty = inner_of_option_ty(&ty);
+        parse_quote!(std::option::Option<diesel::dsl::Eq<#table_name::#column_name, #inner_ty>>)
+    } else {
+        parse_quote!(diesel::dsl::Eq<#table_name::#column_name, #ty>)
+    }
+}
+
+fn field_changeset_expr_serialize_as(
+    field: &Field,
+    table_name: &syn::Path,
+    treat_none_as_null: bool,
+    ty: &syn::Type,
+) -> syn::Expr {
+    let field_access = field.name.access();
+    let column_name = field.column_name_ident();
+    let column: syn::Expr = parse_quote!(#table_name::#column_name);
+    if !treat_none_as_null && is_option_ty(&field.ty) {
+        parse_quote!(self#field_access.map(|x| #column.eq(::std::convert::Into::<#ty>::into(x))))
+    } else {
+        parse_quote!(#table_name::#column_name.eq(::std::convert::Into::<#ty>::into(self#field_access)))
     }
 }
