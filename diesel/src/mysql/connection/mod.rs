@@ -115,6 +115,22 @@ impl MysqlConnection {
         Ok(stmt)
     }
 
+    #[doc(hidden)]
+    pub fn execute_returning_insert_id<T>(&mut self, source: &T) -> QueryResult<usize>
+    where
+        T: QueryFragment<Mysql> + QueryId,
+    {
+        let stmt = self.prepare_query(source)?;
+        unsafe {
+            stmt.execute()?;
+        }
+        Ok(if stmt.affected_rows() == 0 {
+            0
+        } else {
+            stmt.insert_id()
+        })
+    }
+
     fn set_config_options(&mut self) -> QueryResult<()> {
         self.execute("SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT'))")?;
         self.execute("SET time_zone = '+00:00';")?;

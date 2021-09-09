@@ -76,6 +76,11 @@ impl Statement {
         affected_rows as usize
     }
 
+    pub fn insert_id(&self) -> usize {
+        let insert_id = unsafe { ffi::mysql_stmt_insert_id(self.stmt.as_ptr()) };
+        insert_id as usize
+    }
+
     /// This function should be called instead of `execute` for queries which
     /// have a return value. After calling this function, `execute` can never
     /// be called on this statement.
