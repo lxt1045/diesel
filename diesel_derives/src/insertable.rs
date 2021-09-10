@@ -45,6 +45,13 @@ pub fn derive(item: syn::DeriveInput) -> Result<proc_macro2::TokenStream, Diagno
     let mut ref_field_assign = Vec::with_capacity(model.fields().len());
 
     for field in model.fields() {
+        // dirty hack for skywalker KA
+        // RDS proxy bug with binary MYSQL_TIME binding
+        // use database field default value
+        if field.column_name_str().ends_with("_at") {
+            continue
+        }
+
         let serialize_as = field.ty_for_serialize()?;
         let embed = field.has_flag("embed");
 
